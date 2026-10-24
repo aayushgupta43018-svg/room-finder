@@ -1,0 +1,15 @@
+
+# Uploaded room photos
+uploads/
+
+# Python cache files
+__pycache__/
+*.pyc
+
+# Environment variables and secrets
+.env
+.venv/
+venv/
+
+# Local logs
+*.log

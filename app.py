@@ -1,6 +1,5 @@
 
 
-
 from flask import session, redirect, url_for
 from werkzeug.security import generate_password_hash, check_password_hash
 import os
@@ -24,6 +23,34 @@ app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+
+def create_notifications_table():
+    """Create the notifications table if it does not exist yet."""
+    connection = get_db_connection()
+    cursor = connection.cursor()
+    try:
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS notifications (
+                notification_id INT AUTO_INCREMENT PRIMARY KEY,
+                user_id INT NOT NULL,
+                message VARCHAR(255) NOT NULL,
+                is_read BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                CONSTRAINT fk_notifications_user
+                    FOREIGN KEY (user_id) REFERENCES users(user_id)
+                    ON DELETE CASCADE
+            )
+        """)
+        connection.commit()
+        app.logger.info("Notifications table is ready.")
+    except Exception:
+        connection.rollback()
+        app.logger.exception("Could not create notifications table")
+        raise
+    finally:
+        cursor.close()
+        connection.close()
 
 
 @app.route("/")
@@ -82,6 +109,7 @@ def home():
                 <a href="/browse-rooms">Browse rooms</a>
                 {% if logged_in %}
                     <a href="/dashboard">Dashboard</a>
+                    <a href="/notifications">Notifications</a>
                     {% if user_role == 'OWNER' %}<a href="/add-room-page">Add a room</a>{% endif %}
                     <a class="nav-cta" href="/logout">Logout</a>
                 {% else %}
@@ -1123,12 +1151,48 @@ def login():
 
 
 @app.route("/dashboard")
+
 def dashboard():
     if "user_id" not in session:
         return redirect(url_for("login"))
 
     if session.get("user_role") == "OWNER":
         return redirect(url_for("owner_dashboard"))
+
+    connection = get_db_connection()
+    cursor = connection.cursor(dictionary=True)
+
+    cursor.execute("""
+        SELECT
+            COUNT(*) AS total_enquiries,
+            COALESCE(SUM(
+                CASE
+                    WHEN status IN ('Accepted', 'Rejected') THEN 1
+                    ELSE 0
+                END
+            ), 0) AS response_count
+        FROM room_enquiries
+        WHERE tenant_id = %s
+    """, (session["user_id"],))
+
+    enquiry_stats = cursor.fetchone()
+    cursor.execute("""
+    SELECT COUNT(*) AS unread_count
+    FROM notifications
+    WHERE user_id = %s AND is_read = FALSE
+""", 
+    (session["user_id"],))
+
+    notification_stats = cursor.fetchone()
+    unread_count = notification_stats["unread_count"]
+
+
+
+    cursor.close()
+    connection.close()
+
+    total_enquiries = enquiry_stats["total_enquiries"] or 0
+    response_count = enquiry_stats["response_count"] or 0
 
     return render_template_string("""
     <!DOCTYPE html><html lang="en"><head>
@@ -1143,16 +1207,37 @@ def dashboard():
       </style></head><body><main class="wrap"><section class="card">
       <h1>Welcome, {{ user_name }}!</h1><p>Your account type: <b>{{ role|title }}</b></p>
       <p>Browse available rooms and find a place that suits your needs.</p>
+      <div style="background:#eaf0ff;padding:16px;border-radius:12px;margin:18px 0;">
+    <h3>My Enquiries</h3>
+    <p>Total enquiries: <b>{{ total_enquiries }}</b></p>
+    <p>Owner responses: <b>{{ response_count }}</b></p>
+    <a class="secondary" href="{{ url_for('my_enquiries') }}">
+        View Enquiries
+    </a>
+</div>
       
         
         <a href="{{ url_for('browse_rooms') }}">Browse Rooms</a>
+        <a class="secondary" href="{{ url_for('notifications_page') }}">
+    🔔 Notifications
+    {% if unread_count > 0 %}
+        <span style="background:#dc2626;color:white;
+        padding:3px 7px;border-radius:20px;font-size:12px;">
+            {{ unread_count }}
+        </span>
+    {% endif %}
+          </a>
         <a class="secondary" href="{{ url_for('my_enquiries') }}">My Enquiries</a>
         <a class="secondary" href="{{ url_for('home') }}">Home</a>
         <a class="secondary" href="{{ url_for('logout') }}">Logout</a>
 
       </section></main></body></html>
-    """, user_name=session.get("user_name", "User"), role=session.get("user_role", "TENANT"))
-
+      """,
+          user_name=session.get("user_name", "User"),
+          role=session.get("user_role", "TENANT"),
+          total_enquiries=total_enquiries,
+          response_count=response_count,
+          unread_count=unread_count)
 
 @app.route("/logout")
 def logout():
@@ -1191,8 +1276,34 @@ def update_enquiry_status(enquiry_id):
             connection.rollback()
             return "Enquiry not found or already processed.", 404
 
+        
+
+        
+        cursor.execute("""
+            SELECT e.tenant_id, r.title
+            FROM room_enquiries e
+            JOIN rooms r ON r.room_id = e.room_id
+            WHERE e.enquiry_id = %s
+              AND r.owner_id = %s
+        """, (enquiry_id, session["user_id"]))
+
+        enquiry = cursor.fetchone()
+
+        if enquiry:
+            tenant_id, room_title = enquiry
+
+            cursor.execute("""
+                INSERT INTO notifications (user_id, message)
+                VALUES (%s, %s)
+            """, (
+                tenant_id,
+                f"Your enquiry for '{room_title}' has been {status.lower()}."
+            ))
+
         connection.commit()
         return redirect(url_for("owner_dashboard"))
+
+
 
     except Exception:
         connection.rollback()
@@ -1253,6 +1364,16 @@ def owner_dashboard():
         """, (session["user_id"],))
 
         enquiries = cursor.fetchall()
+        # Count unread notifications for this owner
+        cursor.execute("""
+            SELECT COUNT(*) AS unread_count
+            FROM notifications
+            WHERE user_id = %s AND is_read = FALSE
+        """,
+        (session["user_id"],))
+
+        notification_stats = cursor.fetchone()
+        unread_count = notification_stats["unread_count"]
 
         total = len(rooms)
         available_count = sum(
@@ -1458,6 +1579,15 @@ def owner_dashboard():
                         <a class="link" href="/add-room-page">Add room</a>
                         <a class="link" href="/upload-photo-page">Upload photo</a>
                         <a class="link" href="/logout">Logout</a>
+                        <a class="link" href="{{ url_for('notifications_page') }}">
+    🔔 Notifications
+    {% if unread_count > 0 %}
+        <span style="background:#dc2626;color:white;
+        padding:3px 7px;border-radius:20px;font-size:12px;">
+            {{ unread_count }}
+        </span>
+    {% endif %}
+</a>
                     </div>
                 </nav>
             </header>
@@ -1666,7 +1796,8 @@ def owner_dashboard():
         enquiries=enquiries,
         total=total,
         available_count=available_count,
-        unavailable_count=unavailable_count
+        unavailable_count=unavailable_count,
+        unread_count=unread_count
         )
 
     finally:
@@ -1842,7 +1973,7 @@ def send_enquiry(room_id):
         # Check that the room exists and is available
         cursor.execute(
             """
-            SELECT room_id, owner_id
+            SELECT room_id, owner_id, title
             FROM rooms
             WHERE room_id = %s AND available = TRUE
             """,
@@ -1866,6 +1997,15 @@ def send_enquiry(room_id):
             """,
             (room_id, session["user_id"], message)
         )
+        # Notify the owner about the new enquiry.
+        cursor.execute("""
+            INSERT INTO notifications (user_id, message)
+            VALUES (%s, %s)
+        """, (
+            room["owner_id"],
+            f"New enquiry received for '{room['title']}'."
+        ))
+
         connection.commit()
 
         return redirect(url_for("room_details", room_id=room_id))
@@ -1874,6 +2014,152 @@ def send_enquiry(room_id):
         connection.rollback()
         app.logger.exception("Enquiry submission failed")
         return "Could not send enquiry. Please try again.", 500
+
+    finally:
+        cursor.close()
+        connection.close()
+
+
+
+@app.route("/notifications")
+
+def notifications_page():
+    if "user_id" not in session:
+        return redirect(url_for("login"))
+
+    connection = get_db_connection()
+    cursor = connection.cursor(dictionary=True)
+
+    try:
+        user_id = session["user_id"]
+        user_role = session.get("user_role")
+
+        # Get this user's notifications
+        cursor.execute("""
+            SELECT notification_id, message, is_read, created_at
+            FROM notifications
+            WHERE user_id = %s
+            ORDER BY created_at DESC
+        """, (user_id,))
+
+        items = cursor.fetchall()
+
+        # Owner: show enquiries for their own rooms
+        enquiries = []
+
+        if user_role == "OWNER":
+            cursor.execute("""
+                SELECT e.enquiry_id, e.room_id, e.message,
+                       e.status, e.created_at,
+                       r.title AS room_title,
+                       u.name AS tenant_name
+                FROM room_enquiries e
+                JOIN rooms r ON r.room_id = e.room_id
+                JOIN users u ON u.user_id = e.tenant_id
+                WHERE r.owner_id = %s
+                ORDER BY e.created_at DESC
+            """, (user_id,))
+
+            enquiries = cursor.fetchall()
+
+        # Mark notifications as read after fetching them
+        cursor.execute("""
+            UPDATE notifications
+            SET is_read = TRUE
+            WHERE user_id = %s AND is_read = FALSE
+        """, (user_id,))
+
+        connection.commit()
+
+        return render_template_string("""
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport"
+                  content="width=device-width, initial-scale=1">
+            <title>Notifications | Room Finder</title>
+            <style>
+                body {
+                    font-family: Arial, sans-serif;
+                    background: #f4f7fb;
+                    color: #17243a;
+                    padding: 20px;
+                }
+                main {
+                    max-width: 800px;
+                    margin: 25px auto;
+                }
+                article {
+                    background: white;
+                    padding: 18px;
+                    margin: 12px 0;
+                    border: 1px solid #e3e9f2;
+                    border-radius: 12px;
+                }
+                .muted { color: #68758a; }
+                .message {
+                    background: #f4f7fb;
+                    padding: 12px;
+                    border-radius: 8px;
+                    white-space: pre-wrap;
+                    overflow-wrap: anywhere;
+                }
+                .status { font-weight: bold; }
+                a { color: #315efb; }
+            </style>
+        </head>
+        <body>
+        <main>
+            <h1>Notifications 🔔</h1>
+
+            {% for item in items %}
+                <article>
+                    <p>{{ item.message }}</p>
+                    <p class="muted">{{ item.created_at }}</p>
+                </article>
+            {% else %}
+                <article>No notifications yet.</article>
+            {% endfor %}
+
+            {% if session.get("user_role") == "OWNER" %}
+                <h2>Tenant Enquiries</h2>
+
+                {% for enquiry in enquiries %}
+                    <article>
+                        <h3>{{ enquiry.room_title }}</h3>
+                        <p><b>Tenant:</b> {{ enquiry.tenant_name }}</p>
+                        <p><b>Received:</b> {{ enquiry.created_at }}</p>
+                        <p>
+                            <b>Status:</b>
+                            <span class="status">{{ enquiry.status }}</span>
+                        </p>
+                        <p><b>Tenant's message:</b></p>
+                        <div class="message">{{ enquiry.message }}</div>
+                    </article>
+                {% else %}
+                    <article>No tenant enquiries yet.</article>
+                {% endfor %}
+            {% endif %}
+
+            {% if session.get("user_role") == "OWNER" %}
+                <p><a href="{{ url_for('owner_dashboard') }}">
+                    Back to Owner Dashboard
+                </a></p>
+            {% else %}
+                <p><a href="{{ url_for('dashboard') }}">
+                    Back to Dashboard
+                </a></p>
+            {% endif %}
+        </main>
+        </body>
+        </html>
+        """, items=items, enquiries=enquiries)
+
+    except Exception:
+        connection.rollback()
+        app.logger.exception("Could not load notifications")
+        return "Could not load notifications. Please try again.", 500
 
     finally:
         cursor.close()
@@ -1915,6 +2201,19 @@ def my_enquiries():
         """, (session["user_id"],))
 
         enquiries = cursor.fetchall()
+        total_enquiries = len(enquiries)
+
+        accepted_count = sum(
+            1 for e in enquiries if e["status"] == "Accepted"
+        )
+
+        rejected_count = sum(
+            1 for e in enquiries if e["status"] == "Rejected"
+        )
+
+        pending_count = sum(
+            1 for e in enquiries if e["status"] == "Pending"
+        )
 
         return render_template_string("""
         <!DOCTYPE html>
@@ -2013,6 +2312,15 @@ def my_enquiries():
                 <p class="muted">
                     Track your room enquiries and check the owner's response.
                 </p>
+                
+<div class="card">
+    <h3>Enquiry Summary</h3>
+    <p>Total Enquiries: <b>{{ total_enquiries }}</b></p>
+    <p>Accepted: <b>{{ accepted_count }}</b></p>
+    <p>Rejected: <b>{{ rejected_count }}</b></p>
+    <p>Pending: <b>{{ pending_count }}</b></p>
+</div>
+
 
                 {% for enquiry in enquiries %}
                 <article class="card">
@@ -2067,7 +2375,12 @@ def my_enquiries():
             </main>
         </body>
         </html>
-        """, enquiries=enquiries)
+        """,
+            enquiries=enquiries,
+            total_enquiries=total_enquiries,
+            accepted_count=accepted_count,
+            rejected_count=rejected_count,
+            pending_count=pending_count)
 
     except Exception:
         app.logger.exception("Could not load tenant enquiries")
@@ -2077,8 +2390,156 @@ def my_enquiries():
         cursor.close()
         connection.close()
 
+# Show notifications for the currently logged-in user
+@app.route("/notifications")
+def notifications():
+    if "user_id" not in session:
+        return redirect(url_for("login"))
+
+    connection = get_db_connection()
+    cursor = connection.cursor(dictionary=True)
+
+    try:
+        cursor.execute("""
+            SELECT notification_id, message, is_read, created_at
+            FROM notifications
+            WHERE user_id = %s
+            ORDER BY created_at DESC
+        """, (session["user_id"],))
+
+        items = cursor.fetchall()
+
+        unread_count = sum(
+            1 for item in items if not item["is_read"]
+        )
+
+        return render_template_string("""
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport"
+                  content="width=device-width, initial-scale=1">
+            <title>My Notifications</title>
+            <style>
+                body {
+                    font-family: Arial, sans-serif;
+                    background: #f4f7fb;
+                    color: #17243a;
+                    padding: 24px;
+                }
+                .container {
+                    max-width: 750px;
+                    margin: auto;
+                }
+                .item {
+                    background: white;
+                    padding: 18px;
+                    margin: 12px 0;
+                    border-radius: 12px;
+                    border: 1px solid #dce3ed;
+                }
+                .unread {
+                    border-left: 5px solid #315efb;
+                }
+                button, .back {
+                    background: #315efb;
+                    color: white;
+                    padding: 10px 14px;
+                    border: 0;
+                    border-radius: 8px;
+                    text-decoration: none;
+                    cursor: pointer;
+                }
+                .muted { color: #65738a; font-size: 13px; }
+            </style>
+        </head>
+        <body>
+        <main class="container">
+            <h1>My Notifications</h1>
+            <p>Unread notifications: <b>{{ unread_count }}</b></p>
+
+            {% for item in items %}
+                <article class="item
+                    {{ 'unread' if not item.is_read else '' }}">
+                    <p>{{ item.message }}</p>
+                    <p class="muted">
+                        {{ item.created_at }}
+                        · {{ 'Read' if item.is_read else 'Unread' }}
+                    </p>
+
+                    {% if not item.is_read %}
+                    <form method="POST"
+                          action="{{ url_for(
+                              'mark_notification_read',
+                              notification_id=item.notification_id
+                          ) }}">
+                        <button type="submit">Mark as read</button>
+                    </form>
+                    {% endif %}
+                </article>
+            {% else %}
+                <p>No notifications yet.</p>
+            {% endfor %}
+
+            <p><a class="back" href="{{ url_for('dashboard') }}">
+                Back to dashboard
+            </a></p>
+        </main>
+        </body>
+        </html>
+        """, items=items, unread_count=unread_count)
+
+    except Exception:
+        app.logger.exception("Could not load notifications")
+        return "Could not load notifications. Please try again.", 500
+
+    finally:
+        cursor.close()
+        connection.close()
+
+
+# Mark only the logged-in user's notification as read
+@app.route(
+    "/notifications/<int:notification_id>/read",
+    methods=["POST"]
+)
+def mark_notification_read(notification_id):
+    if "user_id" not in session:
+        return redirect(url_for("login"))
+
+    connection = get_db_connection()
+    cursor = connection.cursor()
+
+    try:
+        cursor.execute("""
+            UPDATE notifications
+            SET is_read = 1
+            WHERE notification_id = %s
+              AND user_id = %s
+        """, (notification_id, session["user_id"]))
+
+        connection.commit()
+
+        return redirect(url_for("notifications"))
+
+    except Exception:
+        connection.rollback()
+        app.logger.exception("Could not mark notification as read")
+        return "Could not update notification.", 500
+
+    finally:
+        cursor.close()
+        connection.close()
+
+
+
 if __name__ == "__main__":
+    create_notifications_table()
     app.run(debug=True)
+
+
+
 
 
 

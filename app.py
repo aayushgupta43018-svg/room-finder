@@ -11,11 +11,16 @@ from flask import (
 from werkzeug.utils import secure_filename
 from db import get_db_connection
 
+
 app = Flask(__name__)
-app.secret_key = os.environ.get(
-    "FLASK_SECRET_KEY",
-    "dev-only-change-this-secret-before-deployment"
-)
+
+app.secret_key = os.environ.get("FLASK_SECRET_KEY")
+
+if not app.secret_key:
+    raise RuntimeError(
+        "Please set the FLASK_SECRET_KEY environment variable."
+    )
+
 UPLOAD_FOLDER = os.path.join(app.root_path, "uploads")
 ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png", "webp"}
 
